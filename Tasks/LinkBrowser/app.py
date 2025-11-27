@@ -15,6 +15,7 @@ import json
 import urllib.parse
 import requests
 import os
+import aiomysql
 
 app = FastAPI()
 playwright = None
@@ -24,8 +25,8 @@ context = None
 sticky_port_lock = asyncio.Lock()
 sticky_port = 10000
 
-WORKER_COUNT = 20
-SAVE_URL = "http://dev.bonomalim.com:5678/webhook/save_event_html"
+WORKER_COUNT = 10
+SAVE_URL = "http://n8n:5678/webhook/save_event_html"
 
 
 RABBITMQ_DEFAULT_USER=os.environ.get('RABBITMQ_DEFAULT_USER', None)
@@ -35,8 +36,15 @@ PROXY_USER=os.environ.get('PROXY_USER', None)
 PROXY_PASS=os.environ.get('PROXY_PASS', None) 
 SAVE_USER=os.environ.get('SAVE_USER', None) 
 SAVE_PASS=os.environ.get('SAVE_PASS', None)
+MYSQL_DATABASE=os.environ.get('MYSQL_DATABASE', None)
+MYSQL_USER=os.environ.get('MYSQL_USER', None)
+MYSQL_PASSWORD=os.environ.get('MYSQL_PASSWORD', None)
+MYSQL_HOST=os.environ.get('MYSQL_HOST', None)
 
-if (not RABBITMQ_DEFAULT_USER or not RABBITMQ_DEFAULT_PASS or not RABBITMQ_HOST or not PROXY_USER or not PROXY_PASS or not SAVE_USER or not SAVE_PASS):  
+if (not RABBITMQ_DEFAULT_USER or not RABBITMQ_DEFAULT_PASS or not RABBITMQ_HOST or not PROXY_USER 
+    or not PROXY_PASS or not SAVE_USER or not SAVE_PASS
+    or not MYSQL_DATABASE or not MYSQL_USER or not MYSQL_PASSWORD
+    or not MYSQL_HOST):  
     print("❌ Missing one or more required environment variables:")
     print("   - RABBITMQ_DEFAULT_USER")
     print("   - RABBITMQ_DEFAULT_PASS")
@@ -45,7 +53,25 @@ if (not RABBITMQ_DEFAULT_USER or not RABBITMQ_DEFAULT_PASS or not RABBITMQ_HOST 
     print("   - PROXY_PASS")
     print("   - SAVE_USER")
     print("   - SAVE_PASS")
+    print("   - MYSQL_DATABASE")
+    print("   - MYSQL_USER")
+    print("   - MYSQL_PASSWORD")
+    print("   - MYSQL_HOST")
     exit(1)
+
+pool = None
+
+async def init_pool():
+    global pool
+    pool = await aiomysql.create_pool(
+        host=MYSQL_HOST,
+        port=3306,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        db=MYSQL_DATABASE,
+        minsize=1,
+        maxsize=WORKER_COUNT
+    )
 
 
 def extract_visible_text(html: str):
@@ -111,6 +137,23 @@ async def get_one_message(channel, queue):
     except:
         return None
 
+async def save_content(data):
+    global pool
+    if pool is None:
+        print("Database pool not initialized")
+        return False
+    event_id = data.get("event_id", None)
+    markdown = data.get("markdown", None)
+    html = data.get("html", None)   
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            try:
+                await cur.execute( "UPDATE events SET event_raw_html=%s, event_raw_markdown=%s WHERE id=%s", (html, markdown, event_id))
+                await conn.commit()
+                return True
+            except Exception as e:
+                print(f"Error saving to database: {e}")
+    return False
 
 async def block_unwanted(route, request):
     blocked_types = ["image", "media", "video", "font"]
@@ -149,58 +192,103 @@ async def process_message(message, context):
                 await page.close()
             except Exception as ex:
                 print(ex)
+                return
     except Exception as e:
         print(f"Error parsing message: {e}")
         await message.ack()
         return {"event_id": event_id, "error": str(e)}
+    finally:
+        try:
+            await page.close()
+        except Exception as exp:
+            print("Failed to close page")
+            return
 
-async def  worker(browser):
-    global sticky_port
+async def worker(browser):
+    global sticky_port, pool
 
-    connection = await aio_pika.connect_robust(f"amqp://{RABBITMQ_DEFAULT_USER}:{RABBITMQ_DEFAULT_PASS}@{RABBITMQ_HOST}/%2F")
-    channel = await connection.channel()
-
-    queue = await channel.declare_queue("get_html", durable=True)
-
-    context = None
-    async with sticky_port_lock:
-        context = await browser.new_context(ignore_https_errors=True,
-                                                proxy={
-                                                    "server": f"premium.residential.proxyrack.net:{sticky_port}",
-                                                    "username": f"{PROXY_USER}",
-                                                    "password": f"{PROXY_PASS}"
-                                                    }
-                                                )
-        sticky_port += 1
-    if not context:
-        print("Failed to create context with proxy")
+    if pool is None:
+        print("Database pool not initialized")
         return
 
-    print(f"Worker {sticky_port-1} starting")
-    while True:
-        message = await get_one_message(channel, queue)
-        if message is None:
-            # no messages → pause worker
-            await asyncio.sleep(0.5)
-            continue
+    try:
+        connection = await aio_pika.connect_robust(
+            f"amqp://{RABBITMQ_DEFAULT_USER}:{RABBITMQ_DEFAULT_PASS}@{RABBITMQ_HOST}/%2F"
+        )
+        channel = await connection.channel()
+        queue = await channel.declare_queue("get_html", durable=True)
+    except Exception as e:
+        print("RabbitMQ init failed:", e)
+        return
 
-        extracted_data = await process_message(message, context)
-        if extracted_data:
-            print(f"Worker {sticky_port-1} processed message, saving data...")
-            save_url = SAVE_URL
-            try:
-                save_response = requests.post(save_url, 
-                    auth=(SAVE_USER, SAVE_PASS),
-                    json=extracted_data,
-                    timeout=30)
-                if save_response.status_code == 200:
-                    print(f"Worker {sticky_port-1} successfully saved event_id: {extracted_data.get('event_id')}")
-                else:
-                    print(f"Worker {sticky_port-1} failed to save event_id: {extracted_data.get('event_id')}, status: {save_response.status_code}")
-            except Exception as e:
-                print(f"Worker {sticky_port-1} error saving event_id: {extracted_data.get('event_id')}, error: {e}")
+    # Setup proxy context
+    try:
+        async with sticky_port_lock:
+            port = sticky_port
+            sticky_port += 1
+
+        context = await browser.new_context(
+            ignore_https_errors=True,
+            proxy={
+                "server": f"premium.residential.proxyrack.net:{port}",
+                "username": PROXY_USER,
+                "password": PROXY_PASS
+            }
+        )
+
+        print(f"Worker {port} starting")
+
+    except Exception as e:
+        print(f"Worker {sticky_port} failed to create context: {e}")
+        return
+
+    # MAIN LOOP
+    while True:
+        try:
+            message = await get_one_message(channel, queue)
+
+            if message is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            extracted_data = await process_message(message, context)
+
+            if extracted_data:
+                try:
+                    result = await save_content(extracted_data)
+
+                    if not result:
+                        print(f"Worker {port} failed to save event_id {extracted_data.get('event_id')}")
+                        continue
+
+                    # trim
+                    for key in ("filtered", "html", "markdown", "url"):
+                        extracted_data.pop(key, None)
+
+                    save_response = await asyncio.to_thread(
+                        requests.post,
+                        SAVE_URL,
+                        auth=(SAVE_USER, SAVE_PASS),
+                        json=extracted_data,
+                        timeout=90,
+                    )
+
+                    if save_response.status_code != 200:
+                        print(
+                            f"Worker {port} save failed: event_id={extracted_data.get('event_id')} status={save_response.status_code}"
+                        )
+
+                except Exception as e:
+                    print(f"Worker {port} save error: {e}")
+                    continue
+
+        except Exception as e:
+            print(f"Worker {port} crashed in loop: {e}")
+            await asyncio.sleep(1)
+
 
 async def start():
+    await init_pool()
     playwright = await Stealth().use_async(async_playwright()).manager.start()
     
     # Launch browser
