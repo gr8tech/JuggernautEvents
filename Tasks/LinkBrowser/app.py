@@ -22,10 +22,16 @@ playwright = None
 browser = None
 context = None
 
-sticky_port_lock = asyncio.Lock()
 sticky_port = 10000
 
-WORKER_COUNT = 10
+try:
+    CONTEXT_COUNT = int(os.environ.get('CONTEXT_COUNT', 1))
+    CONTEXT_PAGES = int(os.environ.get('CONTEXT_PAGES', 1))
+except:
+     CONTEXT_COUNT = 1
+     CONTEXT_PAGES = 1
+
+
 SAVE_URL = "http://n8n:5678/webhook/save_event_html"
 
 
@@ -70,7 +76,7 @@ async def init_pool():
         password=MYSQL_PASSWORD,
         db=MYSQL_DATABASE,
         minsize=1,
-        maxsize=WORKER_COUNT
+        maxsize=CONTEXT_COUNT*CONTEXT_PAGES
     )
 
 
@@ -162,20 +168,19 @@ async def block_unwanted(route, request):
     else:
         await route.continue_()
 
-async def process_message(message, context):
+async def process_message(message, page):
     try:
+        await page.goto("about:blank")
         data = json.loads(message.body.decode())
         event_id = data.get('events_id', None)
         event_url = data.get('event_url', None)
         if not event_id or not event_url:
             print("Invalid message data")
-            await message.ack()
             return
-        
-        print(f"Worker processing event_id: {event_id}, event_url: {event_url}")
-        page = await context.new_page()
+
         try:
             decoded_url = urllib.parse.unquote(event_url)
+            print(f"Worker processing event_id: {event_id}, event_url: {decoded_url}")
             await page.route("**/*", block_unwanted)
             await page.goto(decoded_url, timeout=120000)  # 60s timeout
             content = await page.content()
@@ -186,26 +191,18 @@ async def process_message(message, context):
         except Exception as e:
             print(f"Worker {sticky_port} error: {e}")
             return {"event_id": event_id, "error": str(e)}
-        finally:
-            await message.ack()
-            try:
-                await page.close()
-            except Exception as ex:
-                print(ex)
-                return
+
     except Exception as e:
         print(f"Error parsing message: {e}")
-        await message.ack()
         return {"event_id": event_id, "error": str(e)}
     finally:
         try:
-            await page.close()
-        except Exception as exp:
-            print("Failed to close page")
-            return
+            await message.ack()
+        except Exception as ack_err:
+            print(f"FAILED TO ACK MESSAGE: {ack_err}")
 
-async def worker(browser):
-    global sticky_port, pool
+async def worker(page):
+    global pool
 
     if pool is None:
         print("Database pool not initialized")
@@ -221,27 +218,6 @@ async def worker(browser):
         print("RabbitMQ init failed:", e)
         return
 
-    # Setup proxy context
-    try:
-        async with sticky_port_lock:
-            port = sticky_port
-            sticky_port += 1
-
-        context = await browser.new_context(
-            ignore_https_errors=True,
-            proxy={
-                "server": f"premium.residential.proxyrack.net:{port}",
-                "username": PROXY_USER,
-                "password": PROXY_PASS
-            }
-        )
-
-        print(f"Worker {port} starting")
-
-    except Exception as e:
-        print(f"Worker {sticky_port} failed to create context: {e}")
-        return
-
     # MAIN LOOP
     while True:
         try:
@@ -250,15 +226,16 @@ async def worker(browser):
             if message is None:
                 await asyncio.sleep(0.5)
                 continue
-
-            extracted_data = await process_message(message, context)
+            
+            extracted_data = await process_message(message, page)
 
             if extracted_data:
                 try:
+                    print("Saving data")
                     result = await save_content(extracted_data)
 
                     if not result:
-                        print(f"Worker {port} failed to save event_id {extracted_data.get('event_id')}")
+                        print(f"Worker {1} failed to save event_id {extracted_data.get('event_id')}")
                         continue
 
                     # trim
@@ -275,19 +252,36 @@ async def worker(browser):
 
                     if save_response.status_code != 200:
                         print(
-                            f"Worker {port} save failed: event_id={extracted_data.get('event_id')} status={save_response.status_code}"
+                            f"Worker save failed: event_id={extracted_data.get('event_id')} status={save_response.status_code}"
                         )
 
                 except Exception as e:
-                    print(f"Worker {port} save error: {e}")
+                    print(f"Worker save error: {e}")
                     continue
 
         except Exception as e:
-            print(f"Worker {port} crashed in loop: {e}")
+            print(f"Worker crashed in loop: {e}")
             await asyncio.sleep(1)
 
+async def create_contexts(browser):
+    global sticky_port
+    contexts = []
+    for _ in range(CONTEXT_COUNT):
+            port = sticky_port
+            context = await browser.new_context(
+                    ignore_https_errors=True,
+                    proxy={
+                        "server": f"premium.residential.proxyrack.net:{port}",
+                        "username": PROXY_USER,
+                        "password": PROXY_PASS
+                    }
+                )
+            contexts.append(context)
+            sticky_port += 1
+    return contexts
 
 async def start():
+    global pool
     await init_pool()
     playwright = await Stealth().use_async(async_playwright()).manager.start()
     
@@ -296,11 +290,18 @@ async def start():
         args=[
         "--ignore-certificate-errors",
         ])
-    workers = [asyncio.create_task(worker(browser)) for _ in range(WORKER_COUNT)]
+    
+    workers = []
+    contexts = await create_contexts(browser)
+    for _ in range(CONTEXT_PAGES):
+        for ctx in contexts:
+            page = await ctx.new_page()
+            workers.append(asyncio.create_task(worker(page)))
 
     await asyncio.gather(*workers)
 
-    while True:
-        await asyncio.sleep(1)  
+    if pool is not None:
+        pool.close()
+        await pool.wait_closed()
 
 asyncio.run(start())
