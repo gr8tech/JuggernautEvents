@@ -38,6 +38,7 @@ SAVE_URL = "http://n8n:5678/webhook/save_event_html"
 RABBITMQ_DEFAULT_USER=os.environ.get('RABBITMQ_DEFAULT_USER', None)
 RABBITMQ_DEFAULT_PASS=os.environ.get('RABBITMQ_DEFAULT_PASS', None)
 RABBITMQ_HOST=os.environ.get('RABBITMQ_HOST', None)
+PROXY_HOST=os.environ.get('PROXY_HOST', None)
 PROXY_USER=os.environ.get('PROXY_USER', None) 
 PROXY_PASS=os.environ.get('PROXY_PASS', None) 
 SAVE_USER=os.environ.get('SAVE_USER', None) 
@@ -48,7 +49,7 @@ MYSQL_PASSWORD=os.environ.get('MYSQL_PASSWORD', None)
 MYSQL_HOST=os.environ.get('MYSQL_HOST', None)
 
 if (not RABBITMQ_DEFAULT_USER or not RABBITMQ_DEFAULT_PASS or not RABBITMQ_HOST or not PROXY_USER 
-    or not PROXY_PASS or not SAVE_USER or not SAVE_PASS
+    or not PROXY_PASS or not SAVE_USER or not SAVE_PASS or not PROXY_HOST
     or not MYSQL_DATABASE or not MYSQL_USER or not MYSQL_PASSWORD
     or not MYSQL_HOST):  
     print("❌ Missing one or more required environment variables:")
@@ -63,6 +64,7 @@ if (not RABBITMQ_DEFAULT_USER or not RABBITMQ_DEFAULT_PASS or not RABBITMQ_HOST 
     print("   - MYSQL_USER")
     print("   - MYSQL_PASSWORD")
     print("   - MYSQL_HOST")
+    print("   - PROXY_HOST")
     exit(1)
 
 pool = None
@@ -271,7 +273,7 @@ async def create_contexts(browser):
             context = await browser.new_context(
                     ignore_https_errors=True,
                     proxy={
-                        "server": f"premium.residential.proxyrack.net:{port}",
+                        "server": f"{PROXY_HOST}:{port}",
                         "username": PROXY_USER,
                         "password": PROXY_PASS
                     }
